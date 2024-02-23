@@ -17,7 +17,8 @@ use winit::{
 
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
-const TRAIL_VALUE: u32 = 16;
+const TRAIL_FALLOFF: f32 = 0.99;
+const TRAIL_INHERIT: f32 = 0.1;
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -69,7 +70,7 @@ fn main() {
         1,
     );
 
-    let trail = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
+    let trail = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
 
     let alpha_a = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let alpha_b = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
@@ -84,7 +85,6 @@ fn main() {
                 Vec3::expr(1.0, 0.0, 0.0)
             } else {
                 let trail_value = trail.read(pos);
-                let trail_value = trail_value.as_f32() / (TRAIL_VALUE as f32);
                 trail_value * Vec3::splat(1.0)
             };
             display.write(display_pos, color.extend(1.0));
@@ -96,6 +96,7 @@ fn main() {
         &track!(|alpha, next_alpha, t| {
             let pos = dispatch_id().xy() + 1;
             let alpha = alpha.read(pos);
+            let trail_value = trail.read(pos);
             if alpha != 0 {
                 let r = rand(pos, t);
                 if r < u32::MAX / 3 {
@@ -103,12 +104,9 @@ fn main() {
                 } else {
                     next_alpha.write(pos - Vec2::expr(0, 1), 1);
                 }
-                trail.write(pos, TRAIL_VALUE);
+                trail.write(pos, 1.0 + trail_value * TRAIL_INHERIT);
             } else {
-                let trail_value = trail.read(pos);
-                if trail_value > 0 {
-                    trail.write(pos, trail_value - 1);
-                }
+                trail.write(pos, trail_value * TRAIL_FALLOFF);
             }
         }),
     );
