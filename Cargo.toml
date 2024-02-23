@@ -1,0 +1,15 @@
+[package]
+name = "limbo"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+glam = "0.25.0"
+winit = "0.29"
+
+[dependencies.luisa_compute]
+git = "git+https://github.com/LuisaGroup/luisa-compute-rs/"
+rev = "5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+features = ["glam"]
