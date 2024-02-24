@@ -80,7 +80,11 @@ fn main() {
     );
 
     let charges = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
-    let potential = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
+    let field = device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
+
+    let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
+    let particle_velocity =
+        device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
 
     let draw_kernel = Kernel::<fn()>::new(
         &device,
@@ -88,53 +92,95 @@ fn main() {
             let display_pos = dispatch_id().xy();
             let pos = display_pos / SCALING;
             let c = charges.read(pos);
-            let p = potential.read(pos);
-            let color: Expr<Vec3<f32>> = if c != 0.0 {
-                // TODO: Scale color by charge.
-                if c > 0.0 {
-                    Vec3::expr(1.0, 0.0, 0.0)
-                } else {
-                    Vec3::expr(0.0, 0.0, 1.0)
-                }
-                // *(c / MAX_CHARGE as f32)
+            let p = particles.read(pos);
+            let color: Expr<Vec3<f32>> = if p != 0 {
+                Vec3::splat_expr(1.0)
             } else {
-                Vec3::splat_expr(1.0) * ((p / MAX_POTENTIAL as f32) * 0.5 + 0.5)
-            };
+                Vec3::splat_expr(0.0)
+            }; /*if c != 0.0 {
+                   // TODO: Scale color by charge.
+                   if c > 0.0 {
+                       Vec3::expr(1.0, 0.0, 0.0)
+                   } else {
+                       Vec3::expr(0.0, 0.0, 1.0)
+                   }
+                   // *(c / MAX_CHARGE as f32)
+               } else {
+                   Vec3::splat_expr(1.0) * ((p / MAX_POTENTIAL as f32) * 0.5 + 0.5)
+               }; */
             display.write(display_pos, color.extend(1.0));
         }),
     );
 
-    let sample_kernel = Kernel::<fn(u32)>::new(
+    // Grid is staggered.
+    // TODO: Make update use staggered grid instead?
+    let solve_kernel = Kernel::<fn(f32)>::new(
         &device,
-        &track!(|t| {
+        &track!(|step| {
             let pos = dispatch_id().xy();
-            let angle = rand_f32(pos, t, 0) * 2.0 * PI;
-            let dir = Vec2::expr(angle.cos(), angle.sin());
-            let dist = 10.0; // rand
-            let target = pos.cast_f32() + (dir * 10.0);
-            let target = (target + Vec2::splat(0.5)).cast_i32();
-            if target.x < 0
-                || target.x >= GRID_SIZE as i32
-                || target.y < 0
-                || target.y >= GRID_SIZE as i32
-            {
-                return;
-            }
-            let target = target.cast_u32();
+            let charge = charges.read(pos);
+            let x = Vec2::new(1, 0);
+            let y = Vec2::new(0, 1);
+            let dx = (field.read(pos + x) - field.read(pos - x)) / 2.0;
+            let dy = (field.read(pos + y) - field.read(pos - y)) / 2.0;
+            let div = dx.x + dy.y;
+            let curl = dx.y - dy.x;
+            // let ex_charge = Vec2::splat(GRID_SIZE as f32 / 2.0);
+            // let r = pos.cast_f32() - ex_charge;
+            // let r2 = r.dot(r);
+            // let dir = r / r2.sqrt();
+            // field.write(pos, -50.0 / r2 * dir);
         }),
     );
 
-    let update_voltage_kernel = Kernel::<fn(Vec2<u32>, u32)>::new(
+    let update_kernel = Kernel::<fn(f32, u32)>::new(
+        &device,
+        &track!(|dt, t| {
+            // TODO: This should probably move the velocity instead.
+            let pos = dispatch_id().xy();
+            // Also make this gather not scatter.
+            let p = particles.read(pos);
+            if p == 1 {
+                let vel = particle_velocity.read(pos) + field.read(pos) * 1.0 / 30.0;
+                let movement = vel * dt;
+                let sign = (movement > 0.0).cast::<i32>() * 2 - 1;
+                let abs = movement.abs();
+                let int = abs.floor();
+                let frac = abs - int;
+                let int = int.cast_i32();
+                let abs = (Vec2::expr(rand_f32(pos, t, 0), rand_f32(pos, t, 1)) < frac)
+                    .cast::<i32>()
+                    + int;
+                let new_pos = pos.cast_i32() + abs * sign;
+                if new_pos.x < 0
+                    || new_pos.x >= GRID_SIZE as i32
+                    || new_pos.y < 0
+                    || new_pos.y >= GRID_SIZE as i32
+                {
+                    return;
+                }
+                let new_pos = new_pos.cast_u32();
+                if (new_pos != pos).any() {
+                    particles.write(new_pos, 1);
+                    particle_velocity.write(new_pos, vel);
+                    particles.write(pos, 0);
+                } else {
+                    particle_velocity.write(pos, vel);
+                }
+            }
+        }),
+    );
+
+    let write_charge_kernel = Kernel::<fn(Vec2<u32>, f32)>::new(
         &device,
         &track!(|pos, value| {
-            voltages.write(
-                index(pos.cast_i32()),
-                Voltage::from_comps_expr(VoltageComps {
-                    voltage: value,
-                    discharging: false.expr(),
-                    exists: true.expr(),
-                }),
-            );
+            charges.write(pos, value);
+        }),
+    );
+    let write_particle_kernel = Kernel::<fn(Vec2<u32>)>::new(
+        &device,
+        &track!(|pos| {
+            particles.write(pos, 1);
         }),
     );
 
@@ -149,10 +195,13 @@ fn main() {
             (cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            update_voltage_kernel.dispatch([1, 1, 1], &pos, &0);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &-5.0);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            update_voltage_kernel.dispatch([1, 1, 1], &pos, &5);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &5.0);
+        }
+        if active_buttons.contains(&MouseButton::Middle) {
+            write_particle_kernel.dispatch([1, 1, 1], &pos);
         }
     };
     let update_cursor = &mut update_cursor;
@@ -162,6 +211,7 @@ fn main() {
     let start = Instant::now();
 
     let dt = Duration::from_secs_f64(1.0 / 10.0);
+    let step = 1.0;
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -179,10 +229,9 @@ fn main() {
                         // update_cursor(&active_buttons, cursor_pos);
                         {
                             let commands = vec![
-                                update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &t),
-                                propegate_potentials_kernel
-                                    .dispatch_async([GRID_SIZE, GRID_SIZE, 1], &t),
-                                activate_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1]),
+                                solve_kernel
+                                    .dispatch_async([GRID_SIZE - 1, GRID_SIZE - 1, 1], &step),
+                                update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &step, &t),
                                 draw_kernel.dispatch_async([
                                     GRID_SIZE * SCALING,
                                     GRID_SIZE * SCALING,
