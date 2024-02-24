@@ -18,7 +18,8 @@ use winit::{
 
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
-const MAX_VOLTAGE: u32 = 16;
+const MAX_CHARGE: f32 = 5.0;
+const MAX_POTENTIAL: f32 = 5.0;
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -45,34 +46,6 @@ fn rand(pos: Expr<Vec2<u32>>, t: Expr<u32>, c: u32) -> Expr<u32> {
 #[tracked]
 fn rand_f32(pos: Expr<Vec2<u32>>, t: Expr<u32>, c: u32) -> Expr<f32> {
     rand(pos, t, c).as_f32() / u32::MAX as f32
-}
-
-#[tracked]
-fn index(pos: Expr<Vec2<i32>>) -> Expr<u32> {
-    if pos.x < 0 || pos.y < 0 || pos.x >= GRID_SIZE as i32 || pos.y >= GRID_SIZE as i32 {
-        u32::MAX.expr()
-    } else {
-        (pos.x + pos.y * GRID_SIZE as i32).cast_u32()
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Value, PartialEq, Eq)]
-struct Lightning {
-    source: Vec2<u32>,
-    potential: u32,
-    active: bool,
-    exists: bool,
-    // Only exists if active.
-    target: Vec2<u32>,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Value, PartialEq, Eq)]
-struct Voltage {
-    voltage: u32,
-    discharging: bool,
-    exists: bool,
 }
 
 fn main() {
@@ -106,127 +79,48 @@ fn main() {
         1,
     );
 
-    let voltages = device.create_buffer::<Voltage>((GRID_SIZE * GRID_SIZE) as usize);
-    let lightnings = device.create_buffer::<Lightning>((GRID_SIZE * GRID_SIZE) as usize);
+    let charges = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
+    let potential = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
 
     let draw_kernel = Kernel::<fn()>::new(
         &device,
         &track!(|| {
             let display_pos = dispatch_id().xy();
             let pos = display_pos / SCALING;
-            let index = index(pos.cast_i32());
-            let v = voltages.read(index);
-            let l = lightnings.read(index);
-            let color: Expr<Vec3<f32>> = if l.exists {
-                if l.active {
-                    Vec3::expr(1.0, 1.0, 1.0)
+            let c = charges.read(pos);
+            let p = potential.read(pos);
+            let color: Expr<Vec3<f32>> = if c != 0.0 {
+                // TODO: Scale color by charge.
+                if c > 0.0 {
+                    Vec3::expr(1.0, 0.0, 0.0)
                 } else {
-                    Vec3::expr(0.0, l.potential.as_f32() / MAX_VOLTAGE as f32, 1.0)
+                    Vec3::expr(0.0, 0.0, 1.0)
                 }
-            } else if v.exists {
-                Vec3::expr(1.0, v.voltage.as_f32() / MAX_VOLTAGE as f32, 0.0)
+                // *(c / MAX_CHARGE as f32)
             } else {
-                Vec3::expr(0.0, 0.0, 0.0)
+                Vec3::splat_expr(1.0) * ((p / MAX_POTENTIAL as f32) * 0.5 + 0.5)
             };
             display.write(display_pos, color.extend(1.0));
         }),
     );
 
-    let activate_kernel = Kernel::<fn()>::new(
-        &device,
-        &track!(|| {
-            let pos = dispatch_id().xy();
-            let pos_index = index(pos.cast_i32());
-            let lightning = lightnings.read(pos_index);
-            if !(lightning.exists && lightning.active) {
-                return;
-            }
-            let source_lightning = lightnings.read(index(lightning.source.cast_i32()));
-            if source_lightning.exists && !source_lightning.active {
-                let source_lightning = source_lightning.var();
-                *source_lightning.active = true.expr();
-                *source_lightning.target = lightning.target;
-                lightnings.write(index(lightning.source.cast_i32()), source_lightning);
-            }
-        }),
-    );
-
-    let propegate_potentials_kernel = Kernel::<fn(u32)>::new(
+    let sample_kernel = Kernel::<fn(u32)>::new(
         &device,
         &track!(|t| {
             let pos = dispatch_id().xy();
-            let pos_index = index(pos.cast_i32());
-            let voltage = voltages.read(pos_index);
-            let lightning = lightnings.read(pos_index);
-            if !(voltage.exists || lightning.exists) {
-                return;
-            }
-
-            // Perform scan.
-            let next_potential = if lightning.exists {
-                lightning.potential
-            } else {
-                voltage.voltage
-            };
-            if next_potential == 0 {
-                return;
-            }
-            let next_potential = next_potential - 1;
             let angle = rand_f32(pos, t, 0) * 2.0 * PI;
             let dir = Vec2::expr(angle.cos(), angle.sin());
+            let dist = 10.0; // rand
             let target = pos.cast_f32() + (dir * 10.0);
             let target = (target + Vec2::splat(0.5)).cast_i32();
-            let target_index = index(target);
-            if target_index == u32::MAX {
-                return;
-            }
-            let target_lightning = lightnings.read(target_index);
-            if target_lightning.exists
-                && (target_lightning.active || target_lightning.potential > next_potential)
+            if target.x < 0
+                || target.x >= GRID_SIZE as i32
+                || target.y < 0
+                || target.y >= GRID_SIZE as i32
             {
                 return;
             }
-            let next_lightning = Lightning::from_comps_expr(LightningComps {
-                source: pos,
-                potential: next_potential,
-                active: false.expr(),
-                exists: true.expr(),
-                target: Vec2::splat_expr(0),
-            });
-            lightnings.write(target_index, next_lightning);
-        }),
-    );
-
-    let update_kernel = Kernel::<fn(u32)>::new(
-        &device,
-        &track!(|t| {
-            let pos = dispatch_id().xy();
-            let pos_index = index(pos.cast_i32());
-            let voltage = voltages.read(pos_index);
-            let lightning = lightnings.read(pos_index).var();
-            if voltage.exists && **lightning.exists && voltage.voltage < lightning.potential {
-                // Valid target. Activate self.
-                *lightning.active = true.expr();
-                *lightning.target = pos;
-                lightnings.write(pos_index, lightning);
-            } else if **lightning.exists && !lightning.active {
-                // Activate possibly.
-                let source_lightning = lightnings.read(index(lightning.source.cast_i32()));
-                if source_lightning.exists && source_lightning.active {
-                    //     *lightning.active = true.expr();
-                    //     *lightning.target = source_lightning.target;
-                    //     lightnings.write(pos_index, lightning);
-                } else {
-                    // Decay
-                    if lightning.potential == 0 {
-                        *lightning.exists = false.expr();
-                    } else if rand_f32(pos, t, 1) < 0.5 {
-                        *lightning.potential = lightning.potential - 1;
-                    }
-                    lightnings.write(pos_index, lightning);
-                }
-                lightnings.write(pos_index, lightning);
-            }
+            let target = target.cast_u32();
         }),
     );
 
