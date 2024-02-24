@@ -132,46 +132,92 @@ fn main() {
         }),
     );
 
-    let update_kernel = Kernel::<fn(u32)>::new(
+    let activate_kernel = Kernel::<fn()>::new(
+        &device,
+        &track!(|| {
+            let pos = dispatch_id().xy();
+            let pos_index = index(pos.cast_i32());
+            let lightning = lightnings.read(pos_index);
+            if !(lightning.exists && lightning.active) {
+                return;
+            }
+            let source_lightning = lightnings.read(index(lightning.source.cast_i32()));
+            if source_lightning.exists && !source_lightning.active {
+                let source_lightning = source_lightning.var();
+                *source_lightning.active = true.expr();
+                *source_lightning.target = lightning.target;
+                lightnings.write(index(lightning.source.cast_i32()), source_lightning);
+            }
+        }),
+    );
+
+    let propegate_potentials_kernel = Kernel::<fn(u32)>::new(
         &device,
         &track!(|t| {
             let pos = dispatch_id().xy();
             let pos_index = index(pos.cast_i32());
             let voltage = voltages.read(pos_index);
             let lightning = lightnings.read(pos_index);
-            if voltage.exists && lightning.exists && voltage.voltage < lightning.potential {
-                let lightning = lightning.var();
-                // Valid destination.
+            if !(voltage.exists || lightning.exists) {
+                return;
+            }
+
+            // Perform scan.
+            let next_potential = if lightning.exists {
+                lightning.potential
+            } else {
+                voltage.voltage
+            };
+            if next_potential == 0 {
+                return;
+            }
+            let next_potential = next_potential - 1;
+            let angle = rand_f32(pos, t, 0) * 2.0 * PI;
+            let dir = Vec2::expr(angle.cos(), angle.sin());
+            let target = pos.cast_f32() + (dir * 10.0);
+            let target = (target + Vec2::splat(0.5)).cast_i32();
+            let target_index = index(target);
+            if target_index == u32::MAX {
+                return;
+            }
+            let target_lightning = lightnings.read(target_index);
+            if target_lightning.exists
+                && (target_lightning.active || target_lightning.potential > next_potential)
+            {
+                return;
+            }
+            let next_lightning = Lightning::from_comps_expr(LightningComps {
+                source: pos,
+                potential: next_potential,
+                active: false.expr(),
+                exists: true.expr(),
+                target: Vec2::splat_expr(0),
+            });
+            lightnings.write(target_index, next_lightning);
+        }),
+    );
+
+    let update_kernel = Kernel::<fn(u32)>::new(
+        &device,
+        &track!(|t| {
+            let pos = dispatch_id().xy();
+            let pos_index = index(pos.cast_i32());
+            let voltage = voltages.read(pos_index);
+            let lightning = lightnings.read(pos_index).var();
+            if voltage.exists && **lightning.exists && voltage.voltage < lightning.potential {
+                // Valid target. Activate self.
                 *lightning.active = true.expr();
                 *lightning.target = pos;
                 lightnings.write(pos_index, lightning);
-            } else if lightning.active && lightning.exists {
-                // Discharge time.
-                // Activate source.
-                let source_lightning = lightnings.read(index(lightning.source.cast_i32()));
-                if source_lightning.exists && !source_lightning.active {
-                    let source_lightning = source_lightning.var();
-                    *source_lightning.active = true.expr();
-                    *source_lightning.target = lightning.target;
-                    lightnings.write(index(lightning.source.cast_i32()), source_lightning);
-                }
-                // Need double buffering here really.
-            } else if voltage.exists || lightning.exists {
+            } else if **lightning.exists && !lightning.active {
                 // Activate possibly.
                 let source_lightning = lightnings.read(index(lightning.source.cast_i32()));
                 if source_lightning.exists && source_lightning.active {
-                    let lightning = lightning.var();
-                    *lightning.active = true.expr();
-                    *lightning.target = source_lightning.target;
-                    lightnings.write(pos_index, lightning);
-                    // TODO: Necessary?
-                    return;
-                }
-
-                // Decay self
-                if lightning.exists {
-                    // TODO: Interferes with above with return.
-                    let lightning = lightning.var();
+                    //     *lightning.active = true.expr();
+                    //     *lightning.target = source_lightning.target;
+                    //     lightnings.write(pos_index, lightning);
+                } else {
+                    // Decay
                     if lightning.potential == 0 {
                         *lightning.exists = false.expr();
                     } else if rand_f32(pos, t, 1) < 0.5 {
@@ -179,40 +225,7 @@ fn main() {
                     }
                     lightnings.write(pos_index, lightning);
                 }
-
-                // Perform scan.
-                let next_potential = if lightning.exists {
-                    lightning.potential
-                } else {
-                    voltage.voltage
-                };
-                if next_potential == 0 {
-                    return;
-                }
-                let next_potential = next_potential - 1;
-                let angle = rand_f32(pos, t, 0) * 2.0 * PI;
-                let dir = Vec2::expr(angle.cos(), angle.sin());
-                let target = pos.cast_f32() + (dir * (1 << next_potential).cast_f32());
-                let target = (target + Vec2::splat(0.5)).cast_i32();
-                let target_index = index(target);
-                if target_index == u32::MAX {
-                    return;
-                }
-                let target_lightning = lightnings.read(target_index);
-                if target_lightning.exists
-                    && (target_lightning.active || target_lightning.potential > next_potential)
-                {
-                    // TODO: Maybe just rerout active so you still get a better path.
-                    return;
-                }
-                let next_lightning = Lightning::from_comps_expr(LightningComps {
-                    source: pos,
-                    potential: next_potential,
-                    active: false.expr(),
-                    exists: true.expr(),
-                    target: Vec2::splat_expr(0),
-                });
-                lightnings.write(target_index, next_lightning);
+                lightnings.write(pos_index, lightning);
             }
         }),
     );
@@ -273,6 +286,9 @@ fn main() {
                         {
                             let commands = vec![
                                 update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &t),
+                                propegate_potentials_kernel
+                                    .dispatch_async([GRID_SIZE, GRID_SIZE, 1], &t),
+                                activate_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1]),
                                 draw_kernel.dispatch_async([
                                     GRID_SIZE * SCALING,
                                     GRID_SIZE * SCALING,
