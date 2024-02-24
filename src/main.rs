@@ -17,8 +17,6 @@ use winit::{
 
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
-const TRAIL_FALLOFF: f32 = 0.99;
-const TRAIL_INHERIT: f32 = 0.1;
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -70,7 +68,7 @@ fn main() {
         1,
     );
 
-    let trail = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
+    let statics = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
 
     let alpha_a = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let alpha_b = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
@@ -83,9 +81,10 @@ fn main() {
             let alpha = alpha.read(pos);
             let color: Expr<Vec3<f32>> = if alpha == 1 {
                 Vec3::expr(1.0, 0.0, 0.0)
+            } else if statics.read(pos) == 1 {
+                Vec3::splat_expr(0.3)
             } else {
-                let trail_value = trail.read(pos);
-                trail_value * Vec3::splat(1.0)
+                Vec3::splat_expr(0.0)
             };
             display.write(display_pos, color.extend(1.0));
         }),
@@ -96,17 +95,24 @@ fn main() {
         &track!(|alpha, next_alpha, t| {
             let pos = dispatch_id().xy() + 1;
             let alpha = alpha.read(pos);
-            let trail_value = trail.read(pos);
-            if alpha != 0 {
-                let r = rand(pos, t);
-                if r < u32::MAX / 3 {
-                    next_alpha.write(pos + Vec2::expr(1, 0), 1);
-                } else {
-                    next_alpha.write(pos - Vec2::expr(0, 1), 1);
+            let r = rand(pos, t);
+            if alpha == 1 {
+                next_alpha.write(pos - Vec2::expr(0, 1), 1);
+                statics.write(pos, 1);
+            }
+            if alpha == 2 || alpha == 1 {
+                if r >= u32::MAX / 10 {
+                    // Left
+                    next_alpha.write(pos + Vec2::expr(1, 0), 2);
                 }
-                trail.write(pos, 1.0 + trail_value * TRAIL_INHERIT);
-            } else {
-                trail.write(pos, trail_value * TRAIL_FALLOFF);
+                statics.write(pos, 1);
+            }
+            if alpha == 3 || alpha == 1 {
+                if r >= u32::MAX / 10 {
+                    // Right
+                    next_alpha.write(pos - Vec2::expr(1, 0), 3);
+                }
+                statics.write(pos, 1);
             }
         }),
     );
@@ -167,7 +173,7 @@ fn main() {
                         let next_alpha = if parity { &alpha_b } else { &alpha_a };
                         parity = !parity;
                         t += 1;
-                        update_cursor(&active_buttons, cursor_pos, alpha);
+                        // update_cursor(&active_buttons, cursor_pos, alpha);
                         {
                             let commands = vec![
                                 clear_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], next_alpha),
@@ -190,7 +196,7 @@ fn main() {
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor_pos = position;
                     let alpha = if parity { &alpha_a } else { &alpha_b };
-                    update_cursor(&active_buttons, cursor_pos, alpha);
+                    // update_cursor(&active_buttons, cursor_pos, alpha);
                 }
                 WindowEvent::MouseInput { button, state, .. } => {
                     match state {
