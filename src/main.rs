@@ -19,8 +19,45 @@ use winit::{
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
 const MAX_FIELD: f32 = 5.0;
-const DOWNSCALE_COUNT: u32 = 4;
+const DOWNSCALE_COUNT: u32 = 5;
 const CHARGE: f32 = 5.0;
+
+#[derive(Debug, Clone, Copy, Value)]
+#[repr(u32)]
+pub enum View {
+    Field = 0,
+    Divergence = 1,
+    Curl = 2,
+}
+impl View {
+    fn next(&mut self) {
+        *self = match self {
+            Self::Field => Self::Divergence,
+            Self::Divergence => Self::Curl,
+            Self::Curl => Self::Field,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Runtime {
+    cursor_pos: PhysicalPosition<f64>,
+    t: u32,
+    viewed_layer: u32,
+    view: View,
+    activate_multigrid: bool,
+}
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            t: 0,
+            viewed_layer: 0,
+            view: View::Field,
+            activate_multigrid: true,
+        }
+    }
+}
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -94,10 +131,17 @@ fn main() {
         DOWNSCALE_COUNT,
         1,
     );
-    let field_deltas = device.create_tex3d::<f32>(
+    let divergence_error = device.create_tex3d::<f32>(
         PixelStorage::Float2,
         GRID_SIZE + 1,
         GRID_SIZE + 1,
+        DOWNSCALE_COUNT,
+        1,
+    );
+    let curl_error = device.create_tex3d::<f32>(
+        PixelStorage::Float2,
+        GRID_SIZE - 1,
+        GRID_SIZE - 1,
         DOWNSCALE_COUNT,
         1,
     );
@@ -106,9 +150,9 @@ fn main() {
     let particle_velocity =
         device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
 
-    let draw_kernel = Kernel::<fn(u32, bool)>::new(
+    let draw_kernel = Kernel::<fn(u32, View)>::new(
         &device,
-        &track!(|layer, display_error| {
+        &track!(|layer, view| {
             let display_pos = dispatch_id().xy();
             let pos = display_pos / SCALING;
             let field_pos = (pos >> layer).extend(layer);
@@ -123,26 +167,17 @@ fn main() {
                     Vec3::expr(0.0, 0.0, 1.0) * (-c / CHARGE)
                 }
             } else {
-                if display_error {
-                    // let err = field.read(field_pos)
-                    //     / (field.read(field_pos / 2 + Vec3::z()) + 0.001)
-                    //     - 1.0;
-                    // let err = err.abs();
-                    // err.extend(0.0)
-
-                    let curl = field.read(field_pos + Vec3::x()).x
-                        + field.read(field_pos + Vec3::x() + Vec3::y()).y
-                        - field.read(field_pos + Vec3::x() + Vec3::y()).x
-                        - field.read(field_pos + Vec3::y()).y;
-
-                    curl.abs() * Vec3::splat(1.0)
-
-                    // let d = field_deltas.read(field_pos);
-                    // if d > 0.0 {
-                    //     Vec3::expr(0.0, 1.0, 0.0) * d
-                    // } else {
-                    //     Vec3::expr(1.0, 0.0, 0.0) * (-d)
-                    // }
+                if view.as_u32() == View::Curl.expr().as_u32() {
+                    let c = curl_error.read(field_pos);
+                    // TODO: Add color or something.
+                    c.abs() * Vec3::splat(1.0)
+                } else if view.as_u32() == View::Divergence.expr().as_u32() {
+                    let d = divergence_error.read(field_pos);
+                    if d > 0.0 {
+                        Vec3::expr(0.0, 1.0, 0.0) * d
+                    } else {
+                        Vec3::expr(1.0, 0.0, 0.0) * (-d)
+                    }
                 } else {
                     let f = field.read(field_pos) / (1 << layer).as_f32();
                     (f / (MAX_FIELD * 2.0) + 0.5).extend(0.0)
@@ -160,39 +195,72 @@ fn main() {
     // |               |
     // |               |
     // +---------------+
-
-    let solve_divergence = Kernel::<fn(u32)>::new(
+    let compute_divergence = Kernel::<fn(u32)>::new(
         &device,
         &track!(|level| {
             let pos = dispatch_id().xy();
             let charge = charges.read(pos.extend(level));
             let f = field.read(pos.extend(level));
-            let l = f.x;
-            let t = f.y;
+            let l = -f.x;
+            let u = -f.y;
             let r = field.read((pos + Vec2::x()).extend(level)).x;
-            let b = field.read((pos + Vec2::y()).extend(level)).y;
+            let d = field.read((pos + Vec2::y()).extend(level)).y;
             let target_divergence = charge * 1.0;
-            let divergence = r + b - l - t;
-            let delta = (divergence - target_divergence) / 4.0;
+            let divergence = r + d + l + u;
+            let error = divergence - target_divergence;
             // TODO: Implement overrelaxation.
-            field_deltas.write(pos.extend(level), delta);
+            divergence_error.write(pos.extend(level), error);
+        }),
+    );
+    // +---+---+
+    // | u > r |
+    // +-^-+-v-+
+    // | l < d |
+    // +---+---+
+    let compute_curl = Kernel::<fn(u32)>::new(
+        &device,
+        &track!(|level| {
+            let pos = dispatch_id().xy();
+            let target_curl = 0.0;
+            let f = field.read((pos + 1).extend(level));
+
+            let r = field.read((pos + Vec2::x()).extend(level)).x;
+            let d = f.y;
+            let l = -f.x;
+            let u = -field.read((pos + Vec2::y()).extend(level)).y;
+
+            let curl = r + d + l + u;
+            let error = curl - target_curl;
+
+            curl_error.write(pos.extend(level), error);
         }),
     );
     let apply_deltas = Kernel::<fn(u32)>::new(
         &device,
         &track!(|level| {
             let pos = dispatch_id().xy();
-            let additional_delta = Vec2::splat(0.0_f32).var();
+            let delta = Vec2::splat(0.0_f32).var();
+            // Divergence
+            *delta -= -divergence_error.read(pos.extend(level));
             if pos.x > 0 {
-                *additional_delta.x += field_deltas.read((pos - Vec2::x()).extend(level));
+                *delta.x -= divergence_error.read((pos - Vec2::x()).extend(level));
             }
             if pos.y > 0 {
-                *additional_delta.y += field_deltas.read((pos - Vec2::y()).extend(level));
+                *delta.y -= divergence_error.read((pos - Vec2::y()).extend(level));
+            }
+            // Curl
+            if pos.x > 0 && pos.y > 0 {
+                *delta -= curl_error.read((pos - 1).extend(level)) * Vec2::new(-1.0, 1.0);
+            }
+            if pos.x > 0 && (pos.y + 1) < GRID_SIZE << level && pos.x < GRID_SIZE << level {
+                *delta.x -= curl_error.read((pos - Vec2::x()).extend(level));
+            }
+            if pos.y > 0 && (pos.x + 1) < GRID_SIZE << level && pos.y < GRID_SIZE << level {
+                *delta.y -= -curl_error.read((pos - Vec2::y()).extend(level));
             }
             field.write(
                 pos.extend(level),
-                field.read(pos.extend(level)) + field_deltas.read(pos.extend(level))
-                    - additional_delta,
+                field.read(pos.extend(level)) + delta / 4.0,
             );
         }),
     );
@@ -254,7 +322,7 @@ fn main() {
             let pos = dispatch_id().xy();
             let read_pos = pos / 2;
             let v = field.read(read_pos.extend(level + 1)).var();
-            let dv = field_deltas.read(read_pos.extend(level + 1)) * 2.0;
+            let dv = divergence_error.read(read_pos.extend(level + 1)) / 2.0;
             let factor = 1.0 - (1.0 / (1.0 + dv * dv));
             if pos.x % 2 == 1 {
                 *v.x = (v.x + field.read((read_pos + Vec2::x()).extend(level + 1)).x) / 2.0;
@@ -282,11 +350,10 @@ fn main() {
 
     let mut active_buttons = HashSet::new();
 
-    let mut update_cursor = |active_buttons: &HashSet<MouseButton>,
-                             cursor_pos: PhysicalPosition<f64>| {
+    let mut update_cursor = |active_buttons: &HashSet<MouseButton>, rt: &mut Runtime| {
         let pos = Vec2::new(
-            (cursor_pos.x as u32) / SCALING,
-            (cursor_pos.y as u32) / SCALING,
+            (rt.cursor_pos.x as u32) / SCALING,
+            (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
             write_charge_kernel.dispatch([1, 1, 1], &pos, &-CHARGE);
@@ -300,11 +367,7 @@ fn main() {
     };
     let update_cursor = &mut update_cursor;
 
-    let mut update_keyboard = |ev: KeyEvent,
-                               _cursor_pos: PhysicalPosition<f64>,
-                               viewed_layer: &mut u32,
-                               display_error: &mut bool,
-                               activate_multigrid: &mut bool| {
+    let mut update_keyboard = |ev: KeyEvent, rt: &mut Runtime| {
         if ev.state != ElementState::Pressed {
             return;
         }
@@ -313,36 +376,30 @@ fn main() {
         };
         match key {
             KeyCode::KeyL => {
-                *viewed_layer += 1;
-                if *viewed_layer >= DOWNSCALE_COUNT {
-                    *viewed_layer = 0;
+                rt.viewed_layer += 1;
+                if rt.viewed_layer >= DOWNSCALE_COUNT {
+                    rt.viewed_layer = 0;
                 }
             }
             KeyCode::KeyK => {
-                if *viewed_layer == 0 {
-                    *viewed_layer = DOWNSCALE_COUNT - 1;
+                if rt.viewed_layer == 0 {
+                    rt.viewed_layer = DOWNSCALE_COUNT - 1;
                 } else {
-                    *viewed_layer -= 1;
+                    rt.viewed_layer -= 1;
                 }
             }
             KeyCode::KeyD => {
-                *display_error = !*display_error;
+                rt.view.next();
             }
             KeyCode::KeyM => {
-                *activate_multigrid = !*activate_multigrid;
+                rt.activate_multigrid = !rt.activate_multigrid;
             }
             _ => (),
         }
     };
     let update_keyboard = &mut update_keyboard;
 
-    let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
-
-    let mut t = 0;
-    let mut viewed_layer = 0;
-    let mut display_error = false;
-
-    let mut activate_multigrid = true;
+    let mut rt = Runtime::default();
 
     let start = Instant::now();
 
@@ -360,41 +417,40 @@ fn main() {
                     let scope = device.default_stream().scope();
                     scope.present(&swapchain, &display);
 
-                    if dt * t < start.elapsed() {
-                        t += 1;
-                        update_cursor(&active_buttons, cursor_pos);
+                    if dt * rt.t < start.elapsed() {
+                        rt.t += 1;
+                        update_cursor(&active_buttons, &mut rt);
                         {
                             let mut commands = vec![];
                             for i in 1..DOWNSCALE_COUNT {
+                                let size = GRID_SIZE >> i;
                                 commands.push(
-                                    downscale_charges_kernel
-                                        .dispatch_async([GRID_SIZE >> i, GRID_SIZE >> i, 1], &i),
+                                    downscale_charges_kernel.dispatch_async([size, size, 1], &i),
                                 );
                             }
                             for i in (0..DOWNSCALE_COUNT).rev() {
-                                if activate_multigrid && i < DOWNSCALE_COUNT - 1 {
+                                let size = GRID_SIZE >> i;
+                                if rt.activate_multigrid && i < DOWNSCALE_COUNT - 1 {
                                     commands.push(
-                                        upscale_field_kernel.dispatch_async(
-                                            [GRID_SIZE >> i, GRID_SIZE >> i, 1],
-                                            &i,
-                                        ),
+                                        upscale_field_kernel.dispatch_async([size, size, 1], &i),
                                     );
                                 }
                                 commands.extend([
-                                    solve_divergence
-                                        .dispatch_async([GRID_SIZE >> i, GRID_SIZE >> i, 1], &i),
-                                    apply_deltas.dispatch_async(
-                                        [1 + (GRID_SIZE >> i), 1 + (GRID_SIZE >> i), 1],
-                                        &i,
-                                    ),
+                                    compute_divergence.dispatch_async([size, size, 1], &i),
+                                    compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
+                                    apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
                                 ]);
                             }
                             commands.extend([
-                                update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &step, &t),
+                                update_kernel.dispatch_async(
+                                    [GRID_SIZE, GRID_SIZE, 1],
+                                    &step,
+                                    &rt.t,
+                                ),
                                 draw_kernel.dispatch_async(
                                     [GRID_SIZE * SCALING, GRID_SIZE * SCALING, 1],
-                                    &viewed_layer,
-                                    &display_error,
+                                    &rt.viewed_layer,
+                                    &rt.view,
                                 ),
                             ]);
                             scope.submit(commands);
@@ -403,8 +459,8 @@ fn main() {
                     window.request_redraw();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    cursor_pos = position;
-                    update_cursor(&active_buttons, cursor_pos);
+                    rt.cursor_pos = position;
+                    update_cursor(&active_buttons, &mut rt);
                 }
                 WindowEvent::MouseInput { button, state, .. } => {
                     match state {
@@ -415,16 +471,10 @@ fn main() {
                             active_buttons.remove(&button);
                         }
                     }
-                    update_cursor(&active_buttons, cursor_pos);
+                    update_cursor(&active_buttons, &mut rt);
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    update_keyboard(
-                        event,
-                        cursor_pos,
-                        &mut viewed_layer,
-                        &mut display_error,
-                        &mut activate_multigrid,
-                    );
+                    update_keyboard(event, &mut rt);
                 }
                 _ => (),
             },
