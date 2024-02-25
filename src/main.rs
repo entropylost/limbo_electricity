@@ -19,7 +19,7 @@ use winit::{
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
 const MAX_FIELD: f32 = 5.0;
-const DOWNSCALE_COUNT: u32 = 5;
+const DOWNSCALE_COUNT: u32 = 4;
 const CHARGE: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, Value)]
@@ -146,6 +146,8 @@ fn main() {
         1,
     );
 
+    let total_error = device.create_buffer::<f32>(DOWNSCALE_COUNT as usize);
+
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
         device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
@@ -208,6 +210,9 @@ fn main() {
             let target_divergence = charge * 1.0;
             let divergence = r + d + l + u;
             let error = divergence - target_divergence;
+
+            total_error.atomic_ref(level).fetch_max(error.abs());
+
             // TODO: Implement overrelaxation.
             divergence_error.write(pos.extend(level), error);
         }),
@@ -322,8 +327,16 @@ fn main() {
             let pos = dispatch_id().xy();
             let read_pos = pos / 2;
             let v = field.read(read_pos.extend(level + 1)).var();
-            let dv = divergence_error.read(read_pos.extend(level + 1)) / 2.0;
-            let factor = 1.0 - (1.0 / (1.0 + dv * dv));
+            // let this_err = divergence_error.read(pos.extend(level)).abs()
+            //     + curl_error.read(pos.extend(level)).abs();
+            // let err = (divergence_error.read(read_pos.extend(level + 1)).abs()
+            //     + curl_error.read(read_pos.extend(level + 1)).abs())
+            //     / 2.0;
+            // if this_err < err + 0.01 {
+            //     return;
+            // }
+
+            let factor = 1.0; // - (1.0 / (1.0 + err * err * 4.0));
             if pos.x % 2 == 1 {
                 *v.x = (v.x + field.read((read_pos + Vec2::x()).extend(level + 1)).x) / 2.0;
             }
@@ -417,11 +430,14 @@ fn main() {
                     let scope = device.default_stream().scope();
                     scope.present(&swapchain, &display);
 
+                    let total_computation = 0;
+
                     if dt * rt.t < start.elapsed() {
                         rt.t += 1;
                         update_cursor(&active_buttons, &mut rt);
                         {
-                            let mut commands = vec![];
+                            let mut commands =
+                                vec![total_error.copy_from_async(&[0.0; DOWNSCALE_COUNT as usize])];
                             for i in 1..DOWNSCALE_COUNT {
                                 let size = GRID_SIZE >> i;
                                 commands.push(
@@ -435,11 +451,13 @@ fn main() {
                                         upscale_field_kernel.dispatch_async([size, size, 1], &i),
                                     );
                                 }
-                                commands.extend([
-                                    compute_divergence.dispatch_async([size, size, 1], &i),
-                                    compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
-                                    apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
-                                ]);
+                                for _ in 0..2 {
+                                    commands.extend([
+                                        compute_divergence.dispatch_async([size, size, 1], &i),
+                                        compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
+                                        apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
+                                    ]);
+                                }
                             }
                             commands.extend([
                                 update_kernel.dispatch_async(
@@ -453,6 +471,7 @@ fn main() {
                                     &rt.view,
                                 ),
                             ]);
+                            println!("Error: {:?}", total_error.copy_to_vec());
                             scope.submit(commands);
                         }
                     }
