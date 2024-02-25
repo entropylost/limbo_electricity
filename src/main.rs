@@ -147,6 +147,7 @@ fn main() {
     );
 
     let total_error = device.create_buffer::<f32>(DOWNSCALE_COUNT as usize);
+    let total_curl = device.create_buffer::<f32>(DOWNSCALE_COUNT as usize);
 
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
@@ -237,10 +238,12 @@ fn main() {
             let curl = r + d + l + u;
             let error = curl - target_curl;
 
+            total_curl.atomic_ref(level).fetch_max(error.abs());
+
             curl_error.write(pos.extend(level), error);
         }),
     );
-    let apply_deltas = Kernel::<fn(u32)>::new(
+    let apply_divergence_deltas = Kernel::<fn(u32)>::new(
         &device,
         &track!(|level| {
             let pos = dispatch_id().xy();
@@ -253,6 +256,17 @@ fn main() {
             if pos.y > 0 {
                 *delta.y -= divergence_error.read((pos - Vec2::y()).extend(level));
             }
+            field.write(
+                pos.extend(level),
+                field.read(pos.extend(level)) + delta / 4.0,
+            );
+        }),
+    );
+    let apply_curl_deltas = Kernel::<fn(u32)>::new(
+        &device,
+        &track!(|level| {
+            let pos = dispatch_id().xy();
+            let delta = Vec2::splat(0.0_f32).var();
             // Curl
             if pos.x > 0 && pos.y > 0 {
                 *delta -= curl_error.read((pos - 1).extend(level)) * Vec2::new(-1.0, 1.0);
@@ -361,6 +375,14 @@ fn main() {
         }),
     );
 
+    let clear = Kernel::<fn()>::new(
+        &device,
+        &track!(|| {
+            let pos = dispatch_id();
+            field.write(pos, Vec2::splat(0.0));
+        }),
+    );
+
     let mut active_buttons = HashSet::new();
 
     let mut update_cursor = |active_buttons: &HashSet<MouseButton>, rt: &mut Runtime| {
@@ -416,8 +438,10 @@ fn main() {
 
     let start = Instant::now();
 
-    let dt = Duration::from_secs_f64(1.0 / 60.0);
+    let dt = Duration::from_secs_f64(1.0);
     let step = 1.0;
+
+    write_charge_kernel.dispatch([5, 20, 1], &Vec2::new(25, 25), &CHARGE);
 
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
@@ -430,49 +454,84 @@ fn main() {
                     let scope = device.default_stream().scope();
                     scope.present(&swapchain, &display);
 
-                    let total_computation = 0;
+                    update_cursor(&active_buttons, &mut rt);
 
                     if dt * rt.t < start.elapsed() {
                         rt.t += 1;
-                        update_cursor(&active_buttons, &mut rt);
+                        let mut total_computation = 0;
                         {
-                            let mut commands =
-                                vec![total_error.copy_from_async(&[0.0; DOWNSCALE_COUNT as usize])];
                             for i in 1..DOWNSCALE_COUNT {
                                 let size = GRID_SIZE >> i;
-                                commands.push(
-                                    downscale_charges_kernel.dispatch_async([size, size, 1], &i),
-                                );
+
+                                downscale_charges_kernel.dispatch([size, size, 1], &i);
                             }
-                            for i in (0..DOWNSCALE_COUNT).rev() {
-                                let size = GRID_SIZE >> i;
-                                if rt.activate_multigrid && i < DOWNSCALE_COUNT - 1 {
-                                    commands.push(
-                                        upscale_field_kernel.dispatch_async([size, size, 1], &i),
-                                    );
+                            clear.dispatch([GRID_SIZE + 1, GRID_SIZE + 1, DOWNSCALE_COUNT]);
+                            if rt.activate_multigrid {
+                                for i in (0..DOWNSCALE_COUNT).rev() {
+                                    println!("Computing level: {}", i);
+                                    let size = GRID_SIZE >> i;
+                                    if i < DOWNSCALE_COUNT - 1 {
+                                        upscale_field_kernel.dispatch([size, size, 1], &i);
+                                    }
+                                    let mut num_comps = 0;
+                                    let mut needs_curl = true;
+                                    while needs_curl {
+                                        num_comps += 1;
+                                        total_curl
+                                            .view(i as usize..=i as usize)
+                                            .copy_from(&[0.0; 1]);
+                                        compute_curl.dispatch([size - 1, size - 1, 1], &i);
+                                        apply_curl_deltas.dispatch([size + 1, size + 1, 1], &i);
+                                        let curl_error = total_curl.copy_to_vec()[i as usize];
+
+                                        needs_curl &= curl_error > 0.1 * (1 << i) as f32;
+                                    }
+                                    while {
+                                        num_comps += 1;
+                                        total_error
+                                            .view(i as usize..=i as usize)
+                                            .copy_from(&[0.0; 1]);
+                                        compute_divergence.dispatch([size, size, 1], &i);
+                                        apply_divergence_deltas
+                                            .dispatch([size + 1, size + 1, 1], &i);
+
+                                        total_computation += size * size;
+
+                                        let error = total_error.copy_to_vec()[i as usize];
+
+                                        // println!(
+                                        //     "Curl Error: {:?}",
+                                        //     total_curl.copy_to_vec()[i as usize]
+                                        // );
+
+                                        error > 0.1 * (1 << i) as f32
+                                    } {}
+                                    println!("Iterations: {}", num_comps);
                                 }
-                                for _ in 0..2 {
-                                    commands.extend([
-                                        compute_divergence.dispatch_async([size, size, 1], &i),
-                                        compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
-                                        apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
-                                    ]);
-                                }
+                            } else {
+                                while {
+                                    let size = GRID_SIZE;
+                                    total_error.view(0..=0).copy_from(&[0.0; 1]);
+                                    compute_divergence.dispatch([size, size, 1], &0);
+                                    compute_curl.dispatch([size - 1, size - 1, 1], &0);
+                                    // apply_deltas.dispatch([size + 1, size + 1, 1], &0);
+
+                                    total_computation += size * size;
+
+                                    let error = total_error.copy_to_vec()[0];
+                                    error > 0.1
+                                } {}
                             }
-                            commands.extend([
-                                update_kernel.dispatch_async(
-                                    [GRID_SIZE, GRID_SIZE, 1],
-                                    &step,
-                                    &rt.t,
-                                ),
-                                draw_kernel.dispatch_async(
-                                    [GRID_SIZE * SCALING, GRID_SIZE * SCALING, 1],
-                                    &rt.viewed_layer,
-                                    &rt.view,
-                                ),
-                            ]);
+
+                            update_kernel.dispatch([GRID_SIZE, GRID_SIZE, 1], &step, &rt.t);
+                            draw_kernel.dispatch(
+                                [GRID_SIZE * SCALING, GRID_SIZE * SCALING, 1],
+                                &rt.viewed_layer,
+                                &rt.view,
+                            );
+
                             println!("Error: {:?}", total_error.copy_to_vec());
-                            scope.submit(commands);
+                            println!("Computation: {:?}", total_computation);
                         }
                     }
                     window.request_redraw();
