@@ -322,8 +322,8 @@ fn main() {
             let pos = dispatch_id().xy();
             let read_pos = pos / 2;
             let v = field.read(read_pos.extend(level + 1)).var();
-            let dv = divergence_error.read(read_pos.extend(level + 1)) / 2.0;
-            let factor = 1.0 - (1.0 / (1.0 + dv * dv));
+            // let dv = divergence_error.read(read_pos.extend(level + 1)) / 2.0;
+            let factor = 1.0; //  - (1.0 / (1.0 + dv * dv));
             if pos.x % 2 == 1 {
                 *v.x = (v.x + field.read((read_pos + Vec2::x()).extend(level + 1)).x) / 2.0;
             }
@@ -435,11 +435,13 @@ fn main() {
                                         upscale_field_kernel.dispatch_async([size, size, 1], &i),
                                     );
                                 }
-                                commands.extend([
-                                    compute_divergence.dispatch_async([size, size, 1], &i),
-                                    compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
-                                    apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
-                                ]);
+                                for _ in 0..2 {
+                                    commands.extend([
+                                        compute_divergence.dispatch_async([size, size, 1], &i),
+                                        compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
+                                        apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
+                                    ]);
+                                }
                             }
                             commands.extend([
                                 update_kernel.dispatch_async(
