@@ -81,8 +81,7 @@ fn main() {
 
     let charges = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
     let field = device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
-    let field_deltas =
-        device.create_tex3d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 3, 1);
+    let field_deltas = device.create_tex2d::<f32>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
 
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
@@ -137,22 +136,21 @@ fn main() {
             let target_divergence = charge * 1.0;
             let divergence = r + b - l - t;
             let delta = (divergence - target_divergence) / 4.0;
-            field_deltas.write(pos.extend(0), Vec2::expr(delta, delta));
-            field_deltas.write((pos + Vec2::expr(1, 0)).extend(1), Vec2::expr(-delta, 0.0));
-            field_deltas.write((pos + Vec2::expr(0, 1)).extend(2), Vec2::expr(0.0, -delta));
+            field_deltas.write(pos, delta);
         }),
     );
     let apply_deltas = Kernel::<fn()>::new(
         &device,
         &track!(|| {
-            let pos = dispatch_id().xy();
-            let delta = field_deltas.read(pos.extend(0))
-                + field_deltas.read(pos.extend(1))
-                + field_deltas.read(pos.extend(2));
-            field.write(pos, field.read(pos) + delta);
-            field_deltas.write(pos.extend(0), Vec2::splat_expr(0.0));
-            field_deltas.write(pos.extend(1), Vec2::splat_expr(0.0));
-            field_deltas.write(pos.extend(2), Vec2::splat_expr(0.0));
+            let pos = dispatch_id().xy() + 1;
+            field.write(
+                pos,
+                field.read(pos) + field_deltas.read(pos)
+                    - Vec2::expr(
+                        field_deltas.read(pos - Vec2::new(1, 0)),
+                        field_deltas.read(pos - Vec2::new(0, 1)),
+                    ),
+            );
         }),
     );
 
@@ -249,7 +247,7 @@ fn main() {
 
                     if dt * t < start.elapsed() {
                         t += 1;
-                        // update_cursor(&active_buttons, cursor_pos);
+                        update_cursor(&active_buttons, cursor_pos);
                         {
                             let commands = vec![
                                 solve_divergence.dispatch_async([GRID_SIZE - 1, GRID_SIZE - 1, 1]),
