@@ -19,7 +19,7 @@ use winit::{
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
 const MAX_CHARGE: f32 = 5.0;
-const MAX_POTENTIAL: f32 = 5.0;
+const MAX_FIELD: f32 = 5.0;
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -81,6 +81,8 @@ fn main() {
 
     let charges = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
     let field = device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
+    let field_deltas =
+        device.create_tex3d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 3, 1);
 
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
@@ -93,43 +95,64 @@ fn main() {
             let pos = display_pos / SCALING;
             let c = charges.read(pos);
             let p = particles.read(pos);
-            let color: Expr<Vec3<f32>> = if p != 0 {
-                Vec3::splat_expr(1.0)
+            let color: Expr<Vec3<f32>> = if p == 1 {
+                Vec3::expr(1.0, 1.0, 1.0)
+            } else if c != 0.0 {
+                if c > 0.0 {
+                    Vec3::expr(1.0, 0.0, 0.0)
+                } else {
+                    Vec3::expr(0.0, 0.0, 1.0)
+                }
             } else {
-                Vec3::splat_expr(0.0)
-            }; /*if c != 0.0 {
-                   // TODO: Scale color by charge.
-                   if c > 0.0 {
-                       Vec3::expr(1.0, 0.0, 0.0)
-                   } else {
-                       Vec3::expr(0.0, 0.0, 1.0)
-                   }
-                   // *(c / MAX_CHARGE as f32)
-               } else {
-                   Vec3::splat_expr(1.0) * ((p / MAX_POTENTIAL as f32) * 0.5 + 0.5)
-               }; */
+                let f = field.read(pos);
+                if !f.x.is_finite() || !f.y.is_finite() {
+                    Vec3::expr(1.0, 0.0, 1.0)
+                } else {
+                    (f / (MAX_FIELD * 2.0) + 0.5).extend(0.0)
+                }
+            };
             display.write(display_pos, color.extend(1.0));
         }),
     );
 
     // Grid is staggered.
-    // TODO: Make update use staggered grid instead?
-    let solve_kernel = Kernel::<fn(f32)>::new(
+    // +---------------+
+    // |      p.y      |
+    // |               |
+    // | p.x           |
+    // |               |
+    // |               |
+    // +---------------+
+
+    let solve_divergence = Kernel::<fn()>::new(
         &device,
-        &track!(|step| {
+        &track!(|| {
             let pos = dispatch_id().xy();
             let charge = charges.read(pos);
-            let x = Vec2::new(1, 0);
-            let y = Vec2::new(0, 1);
-            let dx = (field.read(pos + x) - field.read(pos - x)) / 2.0;
-            let dy = (field.read(pos + y) - field.read(pos - y)) / 2.0;
-            let div = dx.x + dy.y;
-            let curl = dx.y - dy.x;
-            // let ex_charge = Vec2::splat(GRID_SIZE as f32 / 2.0);
-            // let r = pos.cast_f32() - ex_charge;
-            // let r2 = r.dot(r);
-            // let dir = r / r2.sqrt();
-            // field.write(pos, -50.0 / r2 * dir);
+            let f = field.read(pos);
+            let l = f.x;
+            let t = f.y;
+            let r = field.read(pos + Vec2::expr(1, 0)).x;
+            let b = field.read(pos + Vec2::expr(0, 1)).y;
+            let target_divergence = charge * 1.0;
+            let divergence = r + b - l - t;
+            let delta = (divergence - target_divergence) / 4.0;
+            field_deltas.write(pos.extend(0), Vec2::expr(delta, delta));
+            field_deltas.write((pos + Vec2::expr(1, 0)).extend(1), Vec2::expr(-delta, 0.0));
+            field_deltas.write((pos + Vec2::expr(0, 1)).extend(2), Vec2::expr(0.0, -delta));
+        }),
+    );
+    let apply_deltas = Kernel::<fn()>::new(
+        &device,
+        &track!(|| {
+            let pos = dispatch_id().xy();
+            let delta = field_deltas.read(pos.extend(0))
+                + field_deltas.read(pos.extend(1))
+                + field_deltas.read(pos.extend(2));
+            field.write(pos, field.read(pos) + delta);
+            field_deltas.write(pos.extend(0), Vec2::splat_expr(0.0));
+            field_deltas.write(pos.extend(1), Vec2::splat_expr(0.0));
+            field_deltas.write(pos.extend(2), Vec2::splat_expr(0.0));
         }),
     );
 
@@ -210,7 +233,7 @@ fn main() {
 
     let start = Instant::now();
 
-    let dt = Duration::from_secs_f64(1.0 / 10.0);
+    let dt = Duration::from_secs_f64(1.0 / 60.0);
     let step = 1.0;
 
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -229,8 +252,8 @@ fn main() {
                         // update_cursor(&active_buttons, cursor_pos);
                         {
                             let commands = vec![
-                                solve_kernel
-                                    .dispatch_async([GRID_SIZE - 1, GRID_SIZE - 1, 1], &step),
+                                solve_divergence.dispatch_async([GRID_SIZE - 1, GRID_SIZE - 1, 1]),
+                                apply_deltas.dispatch_async([GRID_SIZE, GRID_SIZE, 1]),
                                 update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &step, &t),
                                 draw_kernel.dispatch_async([
                                     GRID_SIZE * SCALING,
