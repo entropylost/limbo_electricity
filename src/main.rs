@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     env::current_exe,
-    f32::consts::PI,
     time::{Duration, Instant},
 };
 
@@ -12,14 +11,16 @@ use luisa::{
 use luisa_compute as luisa;
 use winit::{
     dpi::PhysicalPosition,
-    event::{ElementState, Event, MouseButton, WindowEvent},
+    event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
 };
 
 const GRID_SIZE: u32 = 128;
 const SCALING: u32 = 8;
-const MAX_CHARGE: f32 = 5.0;
 const MAX_FIELD: f32 = 5.0;
+const DOWNSCALE_COUNT: u32 = 4;
+const CHARGE: f32 = 5.0;
 
 #[tracked]
 fn hash(x: Expr<u32>) -> Expr<u32> {
@@ -79,31 +80,50 @@ fn main() {
         1,
     );
 
-    let charges = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
-    let field = device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
-    let field_deltas = device.create_tex2d::<f32>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
+    let charges = device.create_tex3d::<f32>(
+        PixelStorage::Float1,
+        GRID_SIZE,
+        GRID_SIZE,
+        DOWNSCALE_COUNT,
+        1,
+    );
+    let field = device.create_tex3d::<Vec2<f32>>(
+        PixelStorage::Float2,
+        GRID_SIZE + 1,
+        GRID_SIZE + 1,
+        DOWNSCALE_COUNT,
+        1,
+    );
+    let field_deltas = device.create_tex3d::<f32>(
+        PixelStorage::Float2,
+        GRID_SIZE + 1,
+        GRID_SIZE + 1,
+        DOWNSCALE_COUNT,
+        1,
+    );
 
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
         device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
 
-    let draw_kernel = Kernel::<fn()>::new(
+    let draw_kernel = Kernel::<fn(u32)>::new(
         &device,
-        &track!(|| {
+        &track!(|layer| {
             let display_pos = dispatch_id().xy();
             let pos = display_pos / SCALING;
-            let c = charges.read(pos);
+            let field_pos = (pos >> layer).extend(layer);
+            let c = charges.read(field_pos);
             let p = particles.read(pos);
             let color: Expr<Vec3<f32>> = if p == 1 {
                 Vec3::expr(1.0, 1.0, 1.0)
             } else if c != 0.0 {
                 if c > 0.0 {
-                    Vec3::expr(1.0, 0.0, 0.0)
+                    Vec3::expr(1.0, 0.0, 0.0) * c / CHARGE
                 } else {
-                    Vec3::expr(0.0, 0.0, 1.0)
+                    Vec3::expr(0.0, 0.0, 1.0) * (-c / CHARGE)
                 }
             } else {
-                let f = field.read(pos);
+                let f = field.read(field_pos);
                 if !f.x.is_finite() || !f.y.is_finite() {
                     Vec3::expr(1.0, 0.0, 1.0)
                 } else {
@@ -123,33 +143,37 @@ fn main() {
     // |               |
     // +---------------+
 
-    let solve_divergence = Kernel::<fn()>::new(
+    let solve_divergence = Kernel::<fn(u32)>::new(
         &device,
-        &track!(|| {
+        &track!(|level| {
             let pos = dispatch_id().xy();
-            let charge = charges.read(pos);
-            let f = field.read(pos);
+            let charge = charges.read(pos.extend(level));
+            let f = field.read(pos.extend(level));
             let l = f.x;
             let t = f.y;
-            let r = field.read(pos + Vec2::expr(1, 0)).x;
-            let b = field.read(pos + Vec2::expr(0, 1)).y;
+            let r = field.read((pos + Vec2::x()).extend(level)).x;
+            let b = field.read((pos + Vec2::y()).extend(level)).y;
             let target_divergence = charge * 1.0;
             let divergence = r + b - l - t;
             let delta = (divergence - target_divergence) / 4.0;
-            field_deltas.write(pos, delta);
+            field_deltas.write(pos.extend(level), delta);
         }),
     );
-    let apply_deltas = Kernel::<fn()>::new(
+    let apply_deltas = Kernel::<fn(u32)>::new(
         &device,
-        &track!(|| {
-            let pos = dispatch_id().xy() + 1;
+        &track!(|level| {
+            let pos = dispatch_id().xy();
+            let additional_delta = Vec2::splat(0.0_f32).var();
+            if pos.x > 0 {
+                *additional_delta.x += field_deltas.read((pos - Vec2::x()).extend(level));
+            }
+            if pos.y > 0 {
+                *additional_delta.y += field_deltas.read((pos - Vec2::y()).extend(level));
+            }
             field.write(
-                pos,
-                field.read(pos) + field_deltas.read(pos)
-                    - Vec2::expr(
-                        field_deltas.read(pos - Vec2::new(1, 0)),
-                        field_deltas.read(pos - Vec2::new(0, 1)),
-                    ),
+                pos.extend(level),
+                field.read(pos.extend(level)) + field_deltas.read(pos.extend(level))
+                    - additional_delta,
             );
         }),
     );
@@ -162,7 +186,7 @@ fn main() {
             // Also make this gather not scatter.
             let p = particles.read(pos);
             if p == 1 {
-                let vel = particle_velocity.read(pos) + field.read(pos) * 1.0 / 30.0;
+                let vel = particle_velocity.read(pos) + field.read(pos.extend(0)) * 1.0 / 30.0;
                 let movement = vel * dt;
                 let sign = (movement > 0.0).cast::<i32>() * 2 - 1;
                 let abs = movement.abs();
@@ -192,10 +216,40 @@ fn main() {
         }),
     );
 
+    let downscale_charges_kernel = Kernel::<fn(u32)>::new(
+        &device,
+        &track!(|level| {
+            let target = dispatch_id().xy();
+            let pos = dispatch_id().xy() * 2;
+            let c = (charges.read(pos.extend(level - 1))
+                + charges.read((pos + Vec2::x()).extend(level - 1))
+                + charges.read((pos + Vec2::y()).extend(level - 1))
+                + charges.read((pos + Vec2::x() + Vec2::y()).extend(level - 1)))
+                / 4.0;
+            charges.write(target.extend(level), c);
+        }),
+    );
+
+    let upscale_field_kernel = Kernel::<fn(u32)>::new(
+        &device,
+        &track!(|level| {
+            let pos = dispatch_id().xy();
+            let read_pos = pos / 2;
+            let v = field.read(read_pos.extend(level + 1)).var();
+            if pos.x % 2 == 1 {
+                *v.x = (v.x + field.read((read_pos + Vec2::x()).extend(level + 1)).x) / 2.0;
+            }
+            if pos.y % 2 == 1 {
+                *v.y = (v.y + field.read((read_pos + Vec2::y()).extend(level + 1)).y) / 2.0;
+            }
+            field.write(pos.extend(level), v);
+        }),
+    );
+
     let write_charge_kernel = Kernel::<fn(Vec2<u32>, f32)>::new(
         &device,
         &track!(|pos, value| {
-            charges.write(pos, value);
+            charges.write((pos + dispatch_id().xy()).extend(0), value);
         }),
     );
     let write_particle_kernel = Kernel::<fn(Vec2<u32>)>::new(
@@ -216,10 +270,10 @@ fn main() {
             (cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_charge_kernel.dispatch([1, 1, 1], &pos, &-5.0);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &-CHARGE);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_charge_kernel.dispatch([1, 1, 1], &pos, &5.0);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &CHARGE);
         }
         if active_buttons.contains(&MouseButton::Middle) {
             write_particle_kernel.dispatch([1, 1, 1], &pos);
@@ -227,7 +281,28 @@ fn main() {
     };
     let update_cursor = &mut update_cursor;
 
+    let mut update_keyboard =
+        |ev: KeyEvent, cursor_pos: PhysicalPosition<f64>, viewed_layer: &mut u32| {
+            if ev.state != ElementState::Pressed {
+                return;
+            }
+            let PhysicalKey::Code(key) = ev.physical_key else {
+                panic!("Invalid")
+            };
+            match key {
+                KeyCode::KeyL => {
+                    *viewed_layer += 1;
+                    if *viewed_layer >= DOWNSCALE_COUNT {
+                        *viewed_layer = 0;
+                    }
+                }
+                _ => (),
+            }
+        };
+    let update_keyboard = &mut update_keyboard;
+
     let mut t = 0;
+    let mut viewed_layer = 0;
 
     let start = Instant::now();
 
@@ -249,16 +324,42 @@ fn main() {
                         t += 1;
                         update_cursor(&active_buttons, cursor_pos);
                         {
-                            let commands = vec![
-                                solve_divergence.dispatch_async([GRID_SIZE - 1, GRID_SIZE - 1, 1]),
-                                apply_deltas.dispatch_async([GRID_SIZE, GRID_SIZE, 1]),
+                            let mut commands = vec![];
+                            for i in 1..DOWNSCALE_COUNT {
+                                commands.push(
+                                    downscale_charges_kernel
+                                        .dispatch_async([GRID_SIZE >> i, GRID_SIZE >> i, 1], &i),
+                                );
+                            }
+                            for i in (0..DOWNSCALE_COUNT).rev() {
+                                if i < DOWNSCALE_COUNT - 1 {
+                                    commands.push(
+                                        upscale_field_kernel.dispatch_async(
+                                            [GRID_SIZE >> i, GRID_SIZE >> i, 1],
+                                            &i,
+                                        ),
+                                    );
+                                }
+                                for t in 0..10 {
+                                    commands.extend([
+                                        solve_divergence.dispatch_async(
+                                            [GRID_SIZE >> i, GRID_SIZE >> i, 1],
+                                            &i,
+                                        ),
+                                        apply_deltas.dispatch_async(
+                                            [1 + (GRID_SIZE >> i), 1 + (GRID_SIZE >> i), 1],
+                                            &i,
+                                        ),
+                                    ]);
+                                }
+                            }
+                            commands.extend([
                                 update_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1], &step, &t),
-                                draw_kernel.dispatch_async([
-                                    GRID_SIZE * SCALING,
-                                    GRID_SIZE * SCALING,
-                                    1,
-                                ]),
-                            ];
+                                draw_kernel.dispatch_async(
+                                    [GRID_SIZE * SCALING, GRID_SIZE * SCALING, 1],
+                                    &viewed_layer,
+                                ),
+                            ]);
                             scope.submit(commands);
                         }
                     }
@@ -278,6 +379,9 @@ fn main() {
                         }
                     }
                     update_cursor(&active_buttons, cursor_pos);
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    update_keyboard(event, cursor_pos, &mut viewed_layer);
                 }
                 _ => (),
             },

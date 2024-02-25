@@ -237,9 +237,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.0.86"
+version = "1.0.87"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f9fa1897e4325be0d68d48df6aa1a71ac2ed4d27723887e7754192705350730"
+checksum = "3286b845d0fccbdd15af433f61c5970e711987036cb468f437ff6badd70f4e24"
 dependencies = [
  "libc",
 ]
@@ -588,9 +588,9 @@ dependencies = [
 
 [[package]]
 name = "hermit-abi"
-version = "0.3.6"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd5256b483761cd23699d0da46cc6fd2ee3be420bbe6d020ae4a091e70b7e9fd"
+checksum = "379dada1584ad501b383485dd706b8afb7a70fcbc7f4da7d780638a5a6124a60"
 
 [[package]]
 name = "humantime"
@@ -635,7 +635,7 @@ version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f23ff5ef2b80d608d61efee834934d862cd92461afc0560dedf493e4c033738b"
 dependencies = [
- "hermit-abi 0.3.6",
+ "hermit-abi 0.3.8",
  "libc",
  "windows-sys 0.52.0",
 ]
@@ -756,7 +756,7 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 [[package]]
 name = "luisa_compute"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "bumpalo",
  "env_logger",
@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_api_types"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "bitflags 2.4.2",
  "cbindgen",
@@ -794,7 +794,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_backend"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "lazy_static",
  "libc",
@@ -810,7 +810,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_derive"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "luisa_compute_derive_impl",
  "syn 2.0.50",
@@ -819,7 +819,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_derive_impl"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -830,7 +830,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_ir"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "base64ct",
  "bincode",
@@ -852,7 +852,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_sys"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "cmake",
 ]
@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "luisa_compute_track"
 version = "0.1.1-alpha.1"
-source = "git+git+https://github.com/LuisaGroup/luisa-compute-rs/?rev=5ec6f579026665a1884e53fb92ffda6b6342bf8e#5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+source = "git+https://github.com/iMplode-nZ/luisa-compute-rs/#f023ae59c661a9e61933dc0ac74cb71cd71d5bdc"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",

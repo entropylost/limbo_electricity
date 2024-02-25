@@ -10,6 +10,5 @@ glam = "0.25.0"
 winit = "0.29"
 
 [dependencies.luisa_compute]
-git = "git+https://github.com/LuisaGroup/luisa-compute-rs/"
-rev = "5ec6f579026665a1884e53fb92ffda6b6342bf8e"
+git = "https://github.com/iMplode-nZ/luisa-compute-rs/"
 features = ["glam"]
