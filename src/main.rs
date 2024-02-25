@@ -16,10 +16,11 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-const GRID_SIZE: u32 = 128;
-const SCALING: u32 = 8;
+// TODO: Make this 2047 or something so that mipmapping works.
+const GRID_SIZE: u32 = 512;
+const SCALING: u32 = 4;
 const MAX_FIELD: f32 = 5.0;
-const DOWNSCALE_COUNT: u32 = 5;
+const DOWNSCALE_COUNT: u32 = 7;
 const CHARGE: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, Value)]
@@ -74,10 +75,7 @@ fn hash(x: Expr<u32>) -> Expr<u32> {
 
 #[tracked]
 fn rand(pos: Expr<Vec2<u32>>, t: Expr<u32>, c: u32) -> Expr<u32> {
-    let input = t
-        + pos.x * GRID_SIZE
-        + pos.y * GRID_SIZE * GRID_SIZE
-        + c * GRID_SIZE * GRID_SIZE * GRID_SIZE;
+    let input = t + pos.x * GRID_SIZE + pos.y * GRID_SIZE * GRID_SIZE + c * 1063; //* GRID_SIZE * GRID_SIZE * GRID_SIZE;
     hash(input)
 }
 
@@ -195,9 +193,9 @@ fn main() {
     // |               |
     // |               |
     // +---------------+
-    let compute_divergence = Kernel::<fn(u32)>::new(
+    let compute_divergence = Kernel::<fn(u32, u32)>::new(
         &device,
-        &track!(|level| {
+        &track!(|level, offset| {
             let pos = dispatch_id().xy();
             let charge = charges.read(pos.extend(level));
             let f = field.read(pos.extend(level));
@@ -208,8 +206,12 @@ fn main() {
             let target_divergence = charge * 1.0;
             let divergence = r + d + l + u;
             let error = divergence - target_divergence;
-            // TODO: Implement overrelaxation.
-            divergence_error.write(pos.extend(level), error);
+
+            if (pos.x + pos.y) % 2 == offset {
+                divergence_error.write(pos.extend(level), error * 1.9);
+            } else {
+                divergence_error.write(pos.extend(level), 0.0);
+            }
         }),
     );
     // +---+---+
@@ -235,6 +237,8 @@ fn main() {
             curl_error.write(pos.extend(level), error);
         }),
     );
+    // Note: We don't really gain anything from splitting the divergence and curl calculations.
+    // So if we're running both of them per frame then this is preferable.
     let apply_deltas = Kernel::<fn(u32)>::new(
         &device,
         &track!(|level| {
@@ -323,7 +327,7 @@ fn main() {
             let read_pos = pos / 2;
             let v = field.read(read_pos.extend(level + 1)).var();
             // let dv = divergence_error.read(read_pos.extend(level + 1)) / 2.0;
-            let factor = 1.0; //  - (1.0 / (1.0 + dv * dv));
+            let factor = 1.0; // - (1.0 / (1.0 + dv * dv));
             if pos.x % 2 == 1 {
                 *v.x = (v.x + field.read((read_pos + Vec2::x()).extend(level + 1)).x) / 2.0;
             }
@@ -344,7 +348,7 @@ fn main() {
     let write_particle_kernel = Kernel::<fn(Vec2<u32>)>::new(
         &device,
         &track!(|pos| {
-            particles.write(pos, 1);
+            particles.write(pos + dispatch_id().xy(), 1);
         }),
     );
 
@@ -356,10 +360,10 @@ fn main() {
             (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_charge_kernel.dispatch([1, 1, 1], &pos, &-CHARGE);
+            write_charge_kernel.dispatch([8, 8, 1], &pos, &-CHARGE);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_charge_kernel.dispatch([1, 1, 1], &pos, &CHARGE);
+            write_charge_kernel.dispatch([8, 8, 1], &pos, &CHARGE);
         }
         if active_buttons.contains(&MouseButton::Middle) {
             write_particle_kernel.dispatch([1, 1, 1], &pos);
@@ -406,6 +410,8 @@ fn main() {
     let dt = Duration::from_secs_f64(1.0 / 60.0);
     let step = 1.0;
 
+    let mut parity = 0;
+
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
@@ -418,7 +424,6 @@ fn main() {
                     scope.present(&swapchain, &display);
 
                     if dt * rt.t < start.elapsed() {
-                        rt.t += 1;
                         update_cursor(&active_buttons, &mut rt);
                         {
                             let mut commands = vec![];
@@ -435,12 +440,17 @@ fn main() {
                                         upscale_field_kernel.dispatch_async([size, size, 1], &i),
                                     );
                                 }
-                                for _ in 0..2 {
+                                for _ in 0..4 {
                                     commands.extend([
-                                        compute_divergence.dispatch_async([size, size, 1], &i),
+                                        compute_divergence.dispatch_async(
+                                            [size, size, 1],
+                                            &i,
+                                            &parity,
+                                        ),
                                         compute_curl.dispatch_async([size - 1, size - 1, 1], &i),
                                         apply_deltas.dispatch_async([size + 1, size + 1, 1], &i),
                                     ]);
+                                    parity = 1 - parity;
                                 }
                             }
                             commands.extend([
