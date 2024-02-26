@@ -19,7 +19,7 @@ use winit::{
 // TODO: Make this 2047 or something so that mipmapping works.
 const GRID_SIZE: u32 = 512;
 const SCALING: u32 = 4;
-const MAX_FIELD: f32 = 5.0;
+const MAX_FIELD: f32 = 20.0;
 const DOWNSCALE_COUNT: u32 = 7;
 const CHARGE: f32 = 5.0;
 
@@ -29,13 +29,15 @@ pub enum View {
     Field = 0,
     Divergence = 1,
     Curl = 2,
+    TrailOnly = 3,
 }
 impl View {
     fn next(&mut self) {
         *self = match self {
             Self::Field => Self::Divergence,
             Self::Divergence => Self::Curl,
-            Self::Curl => Self::Field,
+            Self::Curl => Self::TrailOnly,
+            Self::TrailOnly => Self::Field,
         }
     }
 }
@@ -147,6 +149,7 @@ fn main() {
     let particles = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let particle_velocity =
         device.create_tex2d::<Vec2<f32>>(PixelStorage::Float2, GRID_SIZE, GRID_SIZE, 1);
+    let trail = device.create_tex2d::<f32>(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1);
 
     let draw_kernel = Kernel::<fn(u32, View)>::new(
         &device,
@@ -176,9 +179,14 @@ fn main() {
                     } else {
                         Vec3::expr(1.0, 0.0, 0.0) * (-d)
                     }
-                } else {
+                } else if view.as_u32() == View::TrailOnly.expr().as_u32() {
+                    let t = trail.read(pos);
+                    Vec3::splat_expr(t)
+                } else if view.as_u32() == View::Field.expr().as_u32() {
                     let f = field.read(field_pos) / (1 << layer).as_f32();
                     (f / (MAX_FIELD * 2.0) + 0.5).extend(0.0)
+                } else {
+                    Vec3::splat_expr(0.0)
                 }
             };
             display.write(display_pos, color.extend(1.0));
@@ -277,8 +285,12 @@ fn main() {
             // Also make this gather not scatter.
             let p = particles.read(pos);
             if p == 1 {
-                let vel = particle_velocity.read(pos) + field.read(pos.extend(0)) * 1.0 / 30.0;
-                let movement = vel * dt;
+                // let vel = particle_velocity.read(pos) + field.read(pos.extend(0)) * 1.0 / 30.0;
+                let movement = field.read(pos.extend(0));
+                if (movement == Vec2::splat(0.0)).any() {
+                    particles.write(Vec2::new(0, 0), 1);
+                }
+                let movement = movement.normalize();
                 let sign = (movement > 0.0).cast::<i32>() * 2 - 1;
                 let abs = movement.abs();
                 let int = abs.floor();
@@ -298,11 +310,24 @@ fn main() {
                 let new_pos = new_pos.cast_u32();
                 if (new_pos != pos).any() {
                     particles.write(new_pos, 1);
-                    particle_velocity.write(new_pos, vel);
+                    // particle_velocity.write(new_pos, vel);
                     particles.write(pos, 0);
                 } else {
-                    particle_velocity.write(pos, vel);
+                    // particle_velocity.write(pos, vel);
                 }
+            }
+        }),
+    );
+    let update_trail_kernel = Kernel::<fn()>::new(
+        &device,
+        &track!(|| {
+            let pos = dispatch_id().xy();
+            let p = particles.read(pos);
+            let t = trail.read(pos);
+            if p == 1 {
+                trail.write(pos, 1.0);
+            } else if t > 0.0 {
+                trail.write(pos, t - 0.02);
             }
         }),
     );
@@ -360,10 +385,10 @@ fn main() {
             (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_charge_kernel.dispatch([8, 8, 1], &pos, &-CHARGE);
+            write_charge_kernel.dispatch([4, 4, 1], &pos, &-CHARGE);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_charge_kernel.dispatch([8, 8, 1], &pos, &CHARGE);
+            write_charge_kernel.dispatch([4, 4, 1], &pos, &CHARGE);
         }
         if active_buttons.contains(&MouseButton::Middle) {
             write_particle_kernel.dispatch([1, 1, 1], &pos);
@@ -412,6 +437,8 @@ fn main() {
 
     let mut parity = 0;
 
+    let mut avg_iter_time = 0.0;
+
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
         .run(move |event, elwt| match event {
@@ -424,6 +451,8 @@ fn main() {
                     scope.present(&swapchain, &display);
 
                     if dt * rt.t < start.elapsed() {
+                        let iter_st = Instant::now();
+                        rt.t += 1;
                         update_cursor(&active_buttons, &mut rt);
                         {
                             let mut commands = vec![];
@@ -440,7 +469,7 @@ fn main() {
                                         upscale_field_kernel.dispatch_async([size, size, 1], &i),
                                     );
                                 }
-                                for _ in 0..4 {
+                                for _ in 0..16 {
                                     commands.extend([
                                         compute_divergence.dispatch_async(
                                             [size, size, 1],
@@ -459,6 +488,7 @@ fn main() {
                                     &step,
                                     &rt.t,
                                 ),
+                                update_trail_kernel.dispatch_async([GRID_SIZE, GRID_SIZE, 1]),
                                 draw_kernel.dispatch_async(
                                     [GRID_SIZE * SCALING, GRID_SIZE * SCALING, 1],
                                     &rt.viewed_layer,
@@ -466,6 +496,10 @@ fn main() {
                                 ),
                             ]);
                             scope.submit(commands);
+                        }
+                        avg_iter_time = avg_iter_time * 0.9 + iter_st.elapsed().as_secs_f64() * 0.1;
+                        if rt.t % 60 == 0 {
+                            println!("Avg iter time: {}", avg_iter_time * 1000.0);
                         }
                     }
                     window.request_redraw();
