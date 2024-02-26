@@ -19,8 +19,8 @@ use winit::{
 // TODO: Make this 2047 or something so that mipmapping works.
 const GRID_SIZE: u32 = 512;
 const SCALING: u32 = 4;
-const MAX_FIELD: f32 = 20.0;
-const DOWNSCALE_COUNT: u32 = 7;
+const MAX_FIELD: f32 = 5.0;
+const DOWNSCALE_COUNT: u32 = 2;
 const CHARGE: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, Value)]
@@ -124,6 +124,7 @@ fn main() {
         DOWNSCALE_COUNT,
         1,
     );
+    let blockers = device.create_tex2d::<u32>(PixelStorage::Byte1, GRID_SIZE, GRID_SIZE, 1);
     let field = device.create_tex3d::<Vec2<f32>>(
         PixelStorage::Float2,
         GRID_SIZE + 1,
@@ -159,7 +160,9 @@ fn main() {
             let field_pos = (pos >> layer).extend(layer);
             let c = charges.read(field_pos) / (1 << (2 * layer)).as_f32();
             let p = particles.read(pos);
-            let color: Expr<Vec3<f32>> = if p == 1 {
+            let color: Expr<Vec3<f32>> = if blockers.read(pos) == 1 {
+                Vec3::expr(0.0, 0.0, 0.0)
+            } else if p == 1 {
                 Vec3::expr(1.0, 1.0, 1.0)
             } else if c != 0.0 {
                 if c > 0.0 {
@@ -184,7 +187,7 @@ fn main() {
                     Vec3::splat_expr(t)
                 } else if view.as_u32() == View::Field.expr().as_u32() {
                     let f = field.read(field_pos) / (1 << layer).as_f32();
-                    (f / (MAX_FIELD * 2.0) + 0.5).extend(0.0)
+                    f.length() * Vec3::splat(0.2) // (f / (MAX_FIELD * 2.0) + 0.5).extend(0.0)
                 } else {
                     Vec3::splat_expr(0.0)
                 }
@@ -274,6 +277,9 @@ fn main() {
                 pos.extend(level),
                 field.read(pos.extend(level)) + delta / 4.0,
             );
+            if blockers.read(pos) == 1 {
+                field.write(pos.extend(level), Vec2::splat(0.0));
+            }
         }),
     );
 
@@ -370,6 +376,12 @@ fn main() {
             charges.write((pos + dispatch_id().xy()).extend(0), value);
         }),
     );
+    let write_blockers_kernel = Kernel::<fn(Vec2<u32>)>::new(
+        &device,
+        &track!(|pos| {
+            blockers.write((pos + dispatch_id().xy()), 1);
+        }),
+    );
     let write_particle_kernel = Kernel::<fn(Vec2<u32>)>::new(
         &device,
         &track!(|pos| {
@@ -385,10 +397,10 @@ fn main() {
             (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_charge_kernel.dispatch([4, 4, 1], &pos, &-CHARGE);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &-CHARGE);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_charge_kernel.dispatch([4, 4, 1], &pos, &CHARGE);
+            write_blockers_kernel.dispatch([1, 1, 1], &pos);
         }
         if active_buttons.contains(&MouseButton::Middle) {
             write_particle_kernel.dispatch([1, 1, 1], &pos);
@@ -429,6 +441,7 @@ fn main() {
     let update_keyboard = &mut update_keyboard;
 
     let mut rt = Runtime::default();
+    rt.activate_multigrid = false;
 
     let start = Instant::now();
 
