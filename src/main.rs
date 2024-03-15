@@ -17,9 +17,9 @@ use winit::{
 };
 
 // TODO: Make this 2047 or something so that mipmapping works.
-const GRID_SIZE: u32 = 512;
-const SCALING: u32 = 4;
-const MAX_FIELD: f32 = 20.0;
+const GRID_SIZE: u32 = 128;
+const SCALING: u32 = 8;
+const MAX_FIELD: f32 = 5.0;
 const DOWNSCALE_COUNT: u32 = 7;
 const CHARGE: f32 = 5.0;
 
@@ -124,6 +124,13 @@ fn main() {
         DOWNSCALE_COUNT,
         1,
     );
+    let magnets = device.create_tex3d::<f32>(
+        PixelStorage::Float1,
+        GRID_SIZE,
+        GRID_SIZE,
+        DOWNSCALE_COUNT,
+        1,
+    );
     let field = device.create_tex3d::<Vec2<f32>>(
         PixelStorage::Float2,
         GRID_SIZE + 1,
@@ -205,13 +212,12 @@ fn main() {
         &device,
         &track!(|level, offset| {
             let pos = dispatch_id().xy();
-            let charge = charges.read(pos.extend(level));
+            let target_divergence = charges.read(pos.extend(level)) * 1.0;
             let f = field.read(pos.extend(level));
             let l = -f.x;
             let u = -f.y;
             let r = field.read((pos + Vec2::x()).extend(level)).x;
             let d = field.read((pos + Vec2::y()).extend(level)).y;
-            let target_divergence = charge * 1.0;
             let divergence = r + d + l + u;
             let error = divergence - target_divergence;
 
@@ -231,7 +237,7 @@ fn main() {
         &device,
         &track!(|level| {
             let pos = dispatch_id().xy();
-            let target_curl = 0.0;
+            let target_curl = magnets.read(pos.extend(level)) * 1.0;
             let f = field.read((pos + 1).extend(level));
 
             let r = field.read((pos + Vec2::x()).extend(level)).x;
@@ -285,12 +291,13 @@ fn main() {
             // Also make this gather not scatter.
             let p = particles.read(pos);
             if p == 1 {
-                // let vel = particle_velocity.read(pos) + field.read(pos.extend(0)) * 1.0 / 30.0;
-                let movement = field.read(pos.extend(0));
+                let vel = particle_velocity.read(pos) + field.read(pos.extend(0)) * 1.0 / 30.0;
+                let movement = vel * dt;
+                /* field.read(pos.extend(0));
                 if (movement == Vec2::splat(0.0)).any() {
                     particles.write(Vec2::new(0, 0), 1);
                 }
-                let movement = movement.normalize();
+                let movement = movement.normalize();  */
                 let sign = (movement > 0.0).cast::<i32>() * 2 - 1;
                 let abs = movement.abs();
                 let int = abs.floor();
@@ -342,6 +349,11 @@ fn main() {
                 + charges.read((pos + Vec2::y()).extend(level - 1))
                 + charges.read((pos + Vec2::x() + Vec2::y()).extend(level - 1));
             charges.write(target.extend(level), c);
+            let m = magnets.read(pos.extend(level - 1))
+                + magnets.read((pos + Vec2::x()).extend(level - 1))
+                + magnets.read((pos + Vec2::y()).extend(level - 1))
+                + magnets.read((pos + Vec2::x() + Vec2::y()).extend(level - 1));
+            magnets.write(target.extend(level), m);
         }),
     );
 
@@ -370,6 +382,12 @@ fn main() {
             charges.write((pos + dispatch_id().xy()).extend(0), value);
         }),
     );
+    let write_magnet_kernel = Kernel::<fn(Vec2<u32>, f32)>::new(
+        &device,
+        &track!(|pos, value| {
+            magnets.write((pos + dispatch_id().xy()).extend(0), value);
+        }),
+    );
     let write_particle_kernel = Kernel::<fn(Vec2<u32>)>::new(
         &device,
         &track!(|pos| {
@@ -385,10 +403,10 @@ fn main() {
             (rt.cursor_pos.y as u32) / SCALING,
         );
         if active_buttons.contains(&MouseButton::Left) {
-            write_charge_kernel.dispatch([4, 4, 1], &pos, &-CHARGE);
+            write_charge_kernel.dispatch([1, 1, 1], &pos, &-CHARGE);
         }
         if active_buttons.contains(&MouseButton::Right) {
-            write_charge_kernel.dispatch([4, 4, 1], &pos, &CHARGE);
+            write_magnet_kernel.dispatch([1, 1, 1], &pos, &CHARGE);
         }
         if active_buttons.contains(&MouseButton::Middle) {
             write_particle_kernel.dispatch([1, 1, 1], &pos);
@@ -433,7 +451,7 @@ fn main() {
     let start = Instant::now();
 
     let dt = Duration::from_secs_f64(1.0 / 60.0);
-    let step = 1.0;
+    let step = 10.0;
 
     let mut parity = 0;
 

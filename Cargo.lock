@@ -723,7 +723,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "limbo"
+name = "limbo_electricity"
 version = "0.1.0"
 dependencies = [
  "glam",
